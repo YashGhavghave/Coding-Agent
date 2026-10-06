@@ -1,0 +1,26 @@
+[project]
+name = "agent-harness-build"
+version = "0.1.0"
+description = "A small Google ADK coding agent powered by Hugging Face GLM 5.3"
+readme = "README.md"
+authors = [
+    { name = "YashGhavghave", email = "yashghavghave123@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "google-adk>=1.20.0",
+    "json-repair>=0.30.0",
+    "litellm>=1.79.0",
+    "pydantic>=2.13.5",
+    "streamlit>=1.40.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0.0"]
+
+[project.scripts]
+agent-harness-build = "agent_harness_build:main"
+
+[build-system]
+requires = ["uv_build>=0.12.18,<0.13.0"]
+build-backend = "uv_build"
