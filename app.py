@@ -8,6 +8,9 @@ from agent_harness_build.agent import (
     environment_api_key,
     generate_proposal,
     make_unified_diff,
+    OFFLINE_DEMO_TASK,
+    offline_demo_proposal,
+    validate_python_changes,
 )
 
 WORKSPACE_ROOT = Path(__file__).resolve().parent
@@ -67,13 +70,30 @@ if not project_root.is_dir():
 left, right = st.columns([1.45, 1], gap="large")
 with left:
     st.subheader("Developer task")
+    st.session_state.setdefault("task_request", "")
+    task_presets = [
+        ("Validate user fields", "Validate user name and email, normalize the email, and add tests."),
+        ("Reject bad email", "Reject malformed email addresses and blank names; add tests."),
+        ("Cover bad payloads", "Add tests for non-dictionary payloads and missing user fields."),
+    ]
+    preset_columns = st.columns(len(task_presets))
+    for index, (label, preset) in enumerate(task_presets):
+        with preset_columns[index]:
+            if st.button(label, key=f"task_preset_{index}", use_container_width=True):
+                st.session_state["task_request"] = preset
+                st.rerun()
     task = st.text_area(
         "Describe the change",
         placeholder="Add input validation to this API and write a test for it.",
         height=130,
         label_visibility="collapsed",
+        key="task_request",
     )
-    generate = st.button("Analyze and propose", type="primary", use_container_width=True)
+    generate_column, offline_column = st.columns([1.35, 1])
+    with generate_column:
+        generate = st.button("Analyze and propose", type="primary", use_container_width=True)
+    with offline_column:
+        offline_demo = st.button("Load offline example", use_container_width=True)
 with right:
     st.subheader("Selected codebase")
     project_files = sorted(
@@ -84,13 +104,20 @@ with right:
     )[:12]
     st.code("\n".join(project_files) if project_files else "No files found", language="text")
 
-if generate:
+if generate or offline_demo:
     st.session_state.pop("proposal", None)
     st.session_state.pop("proposal_root", None)
     try:
         with st.status("Inspecting files and preparing a proposal...", expanded=True) as status:
-            st.write("The agent is selecting relevant files, reading their contents, and drafting changes.")
-            st.session_state["proposal"] = generate_proposal(task, project_root, token)
+            if offline_demo:
+                if project_root != DEFAULT_PROJECT.resolve():
+                    raise ValueError("The offline example is available for the bundled demo project only.")
+                st.write("Loading the bundled example proposal. No model request is made.")
+                proposal_result = offline_demo_proposal()
+            else:
+                st.write("Understand task → search files → inspect relevant code → draft changes.")
+                proposal_result = generate_proposal(task, project_root, token)
+            st.session_state["proposal"] = proposal_result
             st.session_state["proposal_root"] = str(project_root)
             status.update(label="Proposal ready for review", state="complete", expanded=False)
     except Exception as error:
@@ -103,6 +130,8 @@ if proposal:
         st.stop()
     st.divider()
     st.subheader("Plan")
+    if proposal.get("offline_demo"):
+        st.caption(f"Offline example: {OFFLINE_DEMO_TASK}")
     plan = proposal.get("plan", [])
     if isinstance(plan, list) and plan:
         for index, step in enumerate(plan, start=1):
@@ -111,6 +140,11 @@ if proposal:
         st.write("No plan was returned.")
     if proposal.get("explanation"):
         st.markdown(proposal["explanation"])
+
+    inspected_files = proposal.get("inspected_files", [])
+    if inspected_files:
+        with st.expander(f"Inspected files ({len(inspected_files)})"):
+            st.code("\n".join(inspected_files), language="text")
 
     changes = proposal.get("changes", [])
     if not isinstance(changes, list):
@@ -124,15 +158,43 @@ if proposal:
                 change = next(item for item in changes if item.get("path") == path)
                 with st.popover("View proposed file"):
                     st.code(change.get("content", ""), language=Path(path).suffix.lstrip(".") or "text")
-        if st.button("Apply reviewed changes", type="primary"):
+        python_checks = validate_python_changes(changes)
+        if python_checks:
+            st.subheader("Python syntax check")
+            for path, result in python_checks.items():
+                if result.startswith("Syntax error"):
+                    st.error(f"{path}: {result}")
+                else:
+                    st.success(f"{path}: {result}")
+        apply_column, reject_column = st.columns([1, 1])
+        with apply_column:
+            apply_clicked = st.button("Apply reviewed changes", type="primary", use_container_width=True)
+        with reject_column:
+            reject_clicked = st.button("Reject proposal", use_container_width=True)
+        if reject_clicked:
+            st.session_state.pop("proposal", None)
+            st.session_state.pop("proposal_root", None)
+            st.rerun()
+        if apply_clicked:
             try:
+                syntax_errors = [
+                    f"{path}: {result}" for path, result in python_checks.items()
+                    if result.startswith("Syntax error")
+                ]
+                if syntax_errors:
+                    raise ValueError("Fix Python syntax errors before applying: " + "; ".join(syntax_errors))
                 written = apply_changes(project_root, changes)
                 st.success(f"Updated: {', '.join(written)}")
                 st.session_state.pop("proposal", None)
+                st.session_state.pop("proposal_root", None)
             except Exception as error:
                 st.error(f"Could not apply changes: {error}")
     else:
         st.info("The agent proposed no file edits for this task.")
+        if st.button("Dismiss proposal"):
+            st.session_state.pop("proposal", None)
+            st.session_state.pop("proposal_root", None)
+            st.rerun()
     if proposal.get("validation"):
         st.subheader("Suggested validation")
         st.code(proposal["validation"], language="text")
