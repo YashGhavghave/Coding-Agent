@@ -44,12 +44,15 @@ st.caption("Google ADK orchestrates repository inspection and proposal generatio
 
 with st.sidebar:
     st.subheader("Connection")
-    token = st.text_input(
-        "Hugging Face token",
-        value=environment_api_key(),
+    server_token = environment_api_key()
+    if server_token:
+        st.caption("Using the server's Hugging Face token.")
+    user_token = st.text_input(
+        "Use your own token (optional)" if server_token else "Hugging Face token",
         type="password",
         help="Used only for this session. It is not written to project files.",
     )
+    token = user_token.strip() or server_token
     st.caption("Model: zai-org/GLM-5.3 via Hugging Face Inference Providers")
     st.divider()
     st.subheader("Project")
