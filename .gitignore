@@ -1,4 +1,25 @@
+# Byte-compiled / optimized / cache files
 __pycache__/
-.venv/
-.env
+*.py[cod]
+*$py.class
 .pytest_cache/
+
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment variables & secrets
+.env
+.env.*
+.streamlit/secrets.toml
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# OS generated files
+.DS_Store
+Thumbs.db

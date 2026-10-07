@@ -14,10 +14,37 @@ from google.genai import types
 from json_repair import repair_json
 
 APP_NAME = "harness_coding_agent"
-MODEL = "zai-org/GLM-5.3"
+DEFAULT_MODEL = "GLM 5.3 (HF)"
+MODEL_OPTIONS = {
+    "GLM 5.3 (HF)": {
+        "provider": "openai",
+        "model": "zai-org/GLM-5.3",
+        "api_base": "https://router.huggingface.co/v1",
+        "token_names": ["HF_TOKEN", "HUGGINGFACEHUB_API_TOKEN"],
+        "label": "GLM-5.3 (Hugging Face Inference)",
+    },
+}
 SKIP_DIRECTORIES = {".git", ".venv", "venv", "__pycache__", "node_modules", ".pytest_cache"}
 MAX_FILE_BYTES = 40_000
 OFFLINE_DEMO_TASK = "Validate user name and email, normalize the email, and add tests."
+
+
+def get_model_config(model_name: str = DEFAULT_MODEL) -> dict[str, Any]:
+    try:
+        return MODEL_OPTIONS[model_name].copy()
+    except KeyError as exc:
+        raise ValueError(f"Unsupported model: {model_name}") from exc
+
+
+def discover_project_dirs(root: Path | None = None) -> list[Path]:
+    base = (root or Path.cwd()).resolve()
+    if not base.exists() or not base.is_dir():
+        return []
+    candidates = []
+    for child in sorted(base.iterdir(), key=lambda entry: entry.name.lower()):
+        if child.is_dir() and child.name not in SKIP_DIRECTORIES:
+            candidates.append(child)
+    return candidates
 
 
 def _safe_path(root: Path, relative_path: str) -> Path:
@@ -102,47 +129,130 @@ def _build_tools(
     return list_project_files, read_project_file, search_project_code
 
 
+def _is_valid_proposal(obj: Any) -> bool:
+    if not isinstance(obj, dict):
+        return False
+    # A genuine proposal must contain at least one recognized proposal key
+    return any(k in obj for k in ("plan", "changes", "explanation", "validation"))
+
+
 def _extract_json(text: str) -> dict[str, Any]:
     text = text.strip()
-    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if fenced:
-        text = fenced.group(1)
-    else:
+    if not text:
+        raise ValueError("The model returned an empty response.")
+
+    result: Any = None
+
+    # Strategy 1: Look for JSON in markdown code blocks ```json ... ```
+    fenced_blocks = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    for fenced in fenced_blocks:
+        try:
+            parsed = json.loads(fenced.strip())
+            if _is_valid_proposal(parsed):
+                result = parsed
+                break
+        except Exception:
+            try:
+                parsed = repair_json(fenced.strip(), return_objects=True)
+                if _is_valid_proposal(parsed):
+                    result = parsed
+                    break
+            except Exception:
+                pass
+
+    # Strategy 2: If no fenced JSON found, try parsing outermost { and }
+    if not _is_valid_proposal(result):
         start, end = text.find("{"), text.rfind("}")
-        if start < 0 or end < start:
-            raise ValueError("The model response did not contain a JSON result.")
-        text = text[start : end + 1]
-    try:
-        result = json.loads(text)
-    except json.JSONDecodeError:
-        result = repair_json(text, return_objects=True)
-    if not isinstance(result, dict):
-        raise ValueError("The model response must be a JSON object.")
+        if start >= 0 and end > start:
+            candidate_str = text[start : end + 1].strip()
+            try:
+                parsed = json.loads(candidate_str)
+                if _is_valid_proposal(parsed):
+                    result = parsed
+            except Exception:
+                try:
+                    parsed = repair_json(candidate_str, return_objects=True)
+                    if _is_valid_proposal(parsed):
+                        result = parsed
+                except Exception:
+                    pass
+
+    # Strategy 3: Try repair_json directly on full text
+    if not _is_valid_proposal(result):
+        try:
+            parsed = repair_json(text, return_objects=True)
+            if isinstance(parsed, list) and parsed and _is_valid_proposal(parsed[0]):
+                result = parsed[0]
+            elif _is_valid_proposal(parsed):
+                result = parsed
+        except Exception:
+            pass
+
+    # Strategy 4: Fallback heuristic parser if model responded in free-form Markdown
+    if not _is_valid_proposal(result):
+        plan_steps = []
+        for line in text.splitlines():
+            clean = line.strip()
+            if re.match(r"^(\d+\.|\*|-)\s+", clean):
+                plan_steps.append(re.sub(r"^(\d+\.|\*|-)\s+", "", clean))
+
+        code_blocks = re.findall(r"```(?:\w+)?\n(.*?)```", text, re.DOTALL)
+        changes = []
+        for block in code_blocks:
+            lines = block.strip().splitlines()
+            path = "service.py"
+            content = block.strip()
+            if lines and lines[0].startswith(("#", "//", "/*")):
+                candidate_path = lines[0].lstrip("#/* ").strip()
+                if "." in candidate_path and " " not in candidate_path:
+                    path = candidate_path
+                    content = "\n".join(lines[1:]).strip()
+            changes.append({"path": path, "content": content})
+
+        result = {
+            "plan": plan_steps or ["Implement requested changes in the codebase."],
+            "changes": changes,
+            "explanation": text[:600].strip(),
+            "validation": "",
+        }
+
+    # Normalize structure
     result.setdefault("plan", [])
     result.setdefault("changes", [])
     result.setdefault("explanation", "")
     result.setdefault("validation", "")
+
+    if not isinstance(result["plan"], list):
+        result["plan"] = [str(result["plan"])] if result["plan"] else []
+    if not isinstance(result["changes"], list):
+        result["changes"] = []
+
     return result
 
 
-async def _run_agent(task: str, project_root: Path, api_key: str) -> dict[str, Any]:
+async def _run_agent(task: str, project_root: Path, api_key: str, model_name: str = DEFAULT_MODEL) -> dict[str, Any]:
     accessed_files: set[str] = set()
     list_files, read_file, search_code = _build_tools(project_root, accessed_files)
+    model_config = get_model_config(model_name)
+    lite_llm_model = f"{model_config['provider']}/{model_config['model']}"
+    lite_llm_kwargs: dict[str, Any] = {"model": lite_llm_model, "api_key": api_key}
+    if model_config["api_base"]:
+        lite_llm_kwargs["api_base"] = model_config["api_base"]
     agent = LlmAgent(
         name="coding_agent",
-        model=LiteLlm(
-            model=f"openai/{MODEL}",
-            api_base="https://router.huggingface.co/v1",
-            api_key=api_key,
-        ),
+        model=LiteLlm(**lite_llm_kwargs),
         description="Inspects a local project and proposes focused code changes.",
         instruction=(
-            "You are a careful coding agent. Start by listing files, search for task-related "
-            "symbols or terms, then read the relevant files before proposing edits. Never "
-            "claim to have run tests. Return only a JSON object with keys: plan (array of short steps), "
-            "changes (array of objects with path and complete replacement content), "
-            "explanation (string), validation (string with suggested commands/checks). "
-            "Do not include unchanged files. Preserve existing project conventions."
+            "You are an expert coding agent. First inspect the repository using list_project_files, "
+            "search_project_code, and read_project_file. After understanding the code, you MUST "
+            "provide your final output as a valid JSON object matching this schema:\n"
+            "{\n"
+            '  "plan": ["Step 1 explanation", "Step 2 explanation"],\n'
+            '  "changes": [{"path": "relative/path/to/file.py", "content": "COMPLETE FILE CONTENT"}],\n'
+            '  "explanation": "Summary of what was changed and why.",\n'
+            '  "validation": "Suggested command to verify changes (e.g., python -m unittest ...)"\n'
+            "}\n"
+            "Never include unchanged files. Output only the JSON object."
         ),
         tools=[list_files, search_code, read_file],
     )
@@ -258,12 +368,24 @@ def validate_python_changes(changes: list[dict[str, Any]]) -> dict[str, str]:
     return results
 
 
-def generate_proposal(task: str, project_root: Path, api_key: str) -> dict[str, Any]:
+def generate_proposal(
+    task: str,
+    project_root: Path,
+    api_key: str,
+    model_name: str = DEFAULT_MODEL,
+) -> dict[str, Any]:
     if not task.strip():
         raise ValueError("Enter a coding task first.")
     if not api_key.strip():
-        raise ValueError("Add a Hugging Face token with Inference Providers permission.")
-    return asyncio.run(_run_agent(task.strip(), project_root, api_key.strip()))
+        raise ValueError("Add a Hugging Face token (with Inference Providers permission) before generating a proposal.")
+
+    try:
+        return asyncio.run(_run_agent(task.strip(), project_root, api_key.strip(), model_name=model_name))
+    except Exception as error:
+        err_msg = str(error)
+        if "AuthenticationError" in err_msg or "401" in err_msg:
+            raise ValueError("Invalid Hugging Face token. Please check your token permissions at https://huggingface.co/settings/tokens.") from error
+        raise
 
 
 def apply_changes(project_root: Path, changes: list[dict[str, Any]]) -> list[str]:
@@ -311,5 +433,10 @@ def make_unified_diff(project_root: Path, changes: list[dict[str, Any]]) -> dict
     return diffs
 
 
-def environment_api_key() -> str:
-    return os.getenv("HF_TOKEN", "") or os.getenv("HUGGINGFACEHUB_API_TOKEN", "")
+def environment_api_key(model_name: str = DEFAULT_MODEL) -> str:
+    model_config = get_model_config(model_name)
+    for env_name in model_config["token_names"]:
+        value = os.getenv(env_name, "")
+        if value.strip():
+            return value.strip()
+    return ""
